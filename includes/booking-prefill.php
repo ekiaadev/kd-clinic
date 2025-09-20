@@ -1,13 +1,26 @@
-<?php if (!defined('ABSPATH')) exit;
+<?php
+if (!defined('ABSPATH')) exit;
 
-add_action('wp_enqueue_scripts', function(){
-    if (!kd_is_booking_page()) return;
+/**
+ * Only run on booking pages; fail-safe if helper isn’t present.
+ */
+add_action('wp_enqueue_scripts', function () {
+	if (!function_exists('kd_is_booking_page')) {
+		return;
+	}
+	if (!kd_is_booking_page()) {
+		return;
+	}
 
-    $u = wp_get_current_user();
-    $first = $u->first_name ?: ''; $last = $u->last_name ?: '';
-    if (!$first && !$last) list($first,$last) = kd_split_name($u->display_name);
-    $payload = ['n' => trim($first.' '.$last), 'e' => ($u->user_email ?: '')];
-
-    wp_enqueue_script('kd-booking-prefill', KDC_URL.'assets/js/booking-prefill.js', [], null, true);
-    wp_localize_script('kd-booking-prefill', 'KD_BOOKING', $payload);
-});
+	// Enqueue your existing assets for booking prefill here
+	// Example (keep your original handle/paths):
+	$handle = 'kdcl-booking-prefill';
+	wp_register_script(
+		$handle,
+		trailingslashit(plugin_dir_url(__FILE__)) . '../assets/js/booking-prefill.js',
+		['jquery'],
+		'1.0',
+		true
+	);
+	wp_enqueue_script($handle);
+}, 20);

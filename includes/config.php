@@ -1,27 +1,21 @@
-<?php if (!defined('ABSPATH')) exit;
+<?php
+if (!defined('ABSPATH')) exit;
 
-/* === FORM & PAGE IDS === */
-//if (!defined('KD_FFID_START'))        define('KD_FFID_START', 6);      // Pre-gate FF
-if (!defined('KD_FFID_INTAKE'))       define('KD_FFID_INTAKE', 5);     // Intake FF
-if (!defined('KD_FFID_COMMUNITY'))    define('KD_FFID_COMMUNITY', 10); // Community FF
-if (!defined('KD_FFID_LOSE'))         define('KD_FFID_LOSE', 9);       // Lose A Dress FF
+/** Fluent Forms IDs */
+if (!defined('KD_FFID_COMMUNITY')) define('KD_FFID_COMMUNITY', 10); // Community (no booking)
+if (!defined('KD_FFID_INTAKE'))    define('KD_FFID_INTAKE', 5);     // Nutrition Care
 
-if (!defined('KD_BOOKING_URL'))       define('KD_BOOKING_URL', '/availability/');
-if (!defined('KD_INTAKE_URL'))        define('KD_INTAKE_URL',  '/consultation/');
+/** Booking page (Nutrition Care only) */
+if (!defined('KD_NUTRI_BOOKING_URL')) define('KD_NUTRI_BOOKING_URL', '/services/booking');
 
-/* === PRODUCTS === */
-if (!defined('KD_CONSULT_PRODUCT_ID')) define('KD_CONSULT_PRODUCT_ID', 1316);
-if (!defined('KD_COMM_PRODUCT_ID'))    define('KD_COMM_PRODUCT_ID',    1365); // variable OR use mapping
-if (!defined('KD_LOSE_PRODUCT_ID'))    define('KD_LOSE_PRODUCT_ID',    1373);
+/** Woo products */
+if (!defined('KD_COMM_PRODUCT_ID'))    define('KD_COMM_PRODUCT_ID', 1365); // Community (variable)
+if (!defined('KD_CONSULT_PRODUCT_ID')) define('KD_CONSULT_PRODUCT_ID', 1316); // Nutrition Care booking payment product
 
-/* === LANDING PAGES === */
-if (!defined('KD_COMM_WELCOME_URL')) define('KD_COMM_WELCOME_URL', '/services/thank-you/');
-if (!defined('KD_LOSE_WELCOME_URL')) define('KD_LOSE_WELCOME_URL', '/services/thank-you/');
+/** Service category slug (all service products must be in this category) */
+if (!defined('KD_PAID_CAT_SLUG')) define('KD_PAID_CAT_SLUG', 'paid-services');
 
-/* === POLICIES === */
-if (!defined('KD_PAID_CAT_SLUG'))      define('KD_PAID_CAT_SLUG', 'paid-services');
-if (!defined('KD_CLEAR_CART_ON_FORM')) define('KD_CLEAR_CART_ON_FORM', true);
-
-/* === Toggles (optional) === */
-if (!defined('KD_ENABLE_BOOKING_PREFILL'))  define('KD_ENABLE_BOOKING_PREFILL',  true);
-if (!defined('KD_ENABLE_CHECKOUT_PREFILL')) define('KD_ENABLE_CHECKOUT_PREFILL', true);
+/** Coupon codes */
+if (!defined('KD_COUPON_HMO'))      define('KD_COUPON_HMO', 'KD-HMO');         // 100%
+if (!defined('KD_COUPON_UNION'))    define('KD_COUPON_UNION', 'KD-UNION');     // 40%
+if (!defined('KD_COUPON_PROVIDUS')) define('KD_COUPON_PROVIDUS', 'KD-PROVIDUS'); // 30%

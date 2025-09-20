@@ -60,7 +60,30 @@ add_action('add_meta_boxes', function () {
             if (!$payload) { echo '<p>'.esc_html__('No structured payload found.', 'kd-clinic').'</p>'; return; }
 
             echo '<table class="widefat striped"><tbody>';
+            // Skip internal/tech keys
+            $__kd_skip_keys = [
+                'fluentform_embded_post_id',
+                'fluent_form_embded_post_id',
+                'fluentform_5_fluentformnonce',
+                'fluentformnonce',
+                'wp_http_referer'
+            ];
+            $__kd_skip_labels = [
+                'fluent form embded post id',
+                'fluentform 5 fluentformnonce',
+                'wp http referer'
+            ];
+            
             foreach ($payload as $key => $val) {
+                $norm_key   = sanitize_key($key);
+                $norm_label = strtolower(trim(is_string($key) ? $key : (string)$key));
+            
+                if (in_array($norm_key, $__kd_skip_keys, true) || in_array($norm_label, $__kd_skip_labels, true)) {
+                    continue;
+                }
+            
+                // ... existing row output for $key / $val stays the same below ...
+
                 $label = ucwords(str_replace(['_','-'], ' ', (string)$key));
                 echo '<tr><th style="width:260px">'.esc_html($label).'</th><td>';
                 if (is_array($val)) {

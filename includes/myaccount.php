@@ -134,15 +134,15 @@ add_action('woocommerce_account_intakes_endpoint', function () {
         $intake_id = get_the_ID();
         $date      = esc_html(get_the_date());
 
-        // ORDER (use cached meta first; else resolve & cache; link to My Account view-order)
+        // ORDER (resolve & cache as before)
         $order_id = (int) get_post_meta($intake_id, '_kd_order_id', true);
         if (!$order_id) {
             $order_id = kdcl_resolve_order_for_intake($intake_id);
         }
-
+        
         if ($order_id && ($order = wc_get_order($order_id))) {
-            $order_link = esc_url( wc_get_endpoint_url('view-order', $order_id, wc_get_page_permalink('myaccount')) );
-            $order_col  = '<a href="'.$order_link.'">#'.intval($order_id).'</a>';
+            // Client view: show plain order number (no link) to avoid bad endpoints
+            $order_col  = '#' . intval($order_id);
             $status_col = esc_html( wc_get_order_status_name( $order->get_status() ) );
         } else {
             $order_col  = '—';

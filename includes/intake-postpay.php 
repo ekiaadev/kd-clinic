@@ -1,0 +1,100 @@
+<?php
+if (!defined('ABSPATH')) exit;
+
+/**
+ * Build a normalized payload from Fluent Forms details for a submission.
+ */
+function kdcl_build_ff_payload($entry_id) {
+    global $wpdb;
+    $details = $wpdb->prefix . 'fluentform_entry_details';
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT field_name, field_value FROM {$details} WHERE submission_id = %d",
+        (int)$entry_id
+    ), ARRAY_A);
+
+    $payload = [];
+    if ($rows) {
+        foreach ($rows as $r) {
+            $k = isset($r['field_name']) ? sanitize_key($r['field_name']) : '';
+            $v = isset($r['field_value']) ? maybe_unserialize($r['field_value']) : '';
+            if ($k === '') continue;
+            $payload[$k] = $v;
+        }
+    }
+    return $payload;
+}
+
+/**
+ * Ensure Intake CPT exists for a paid Nutrition Care order.
+ * Idempotent: returns existing intake_id if already set.
+ */
+function kdcl_ensure_intake_for_order($order_id) {
+    $order = wc_get_order($order_id);
+    if (!$order) return 0;
+
+    // Only if this order contains the Nutrition Care booking product
+    $has_consult = false;
+    foreach ($order->get_items('line_item') as $item) {
+        $pid = (int)$item->get_product_id();
+        $base = $pid;
+        if ($vid = (int)$item->get_variation_id()) {
+            $parent = wp_get_post_parent_id($vid);
+            if ($parent) $base = (int)$parent;
+        }
+        if (defined('KD_CONSULT_PRODUCT_ID') && $base === (int)KD_CONSULT_PRODUCT_ID) {
+            $has_consult = true; break;
+        }
+    }
+    if (!$has_consult) return 0;
+
+    // If already created
+    $existing = (int)$order->get_meta('_kd_intake_id');
+    if ($existing > 0 && get_post($existing)) return $existing;
+
+    // We set this on checkout create (defer-entries.php)
+    $entry_id = (int)$order->get_meta('_kd_pending_entry_id');
+    if (!$entry_id) return 0;
+
+    $payload = kdcl_build_ff_payload($entry_id);
+
+    // Title from name fallback
+    $name = '';
+    foreach (['names','full_name','fullname','name','first_name'] as $k) {
+        if (!empty($payload[$k])) {
+            $name = is_array($payload[$k]) ? implode(' ', $payload[$k]) : (string)$payload[$k];
+            break;
+        }
+    }
+    if (!$name && !empty($payload['email'])) $name = (string)$payload['email'];
+    $title = $name ? sprintf('%s (Intake – %d)', wp_strip_all_tags($name), $entry_id) : sprintf('Intake – %d', $entry_id);
+
+    // Create Intake post
+    $intake_id = wp_insert_post([
+        'post_title'   => $title,
+        'post_type'    => 'kh_intake',
+        'post_status'  => 'private',
+        'post_author'  => (int)($order->get_user_id() ?: 0),
+        'post_content' => '',
+    ], true);
+    if (is_wp_error($intake_id) || !$intake_id) return 0;
+
+    // Save meta & bi-directional links
+    update_post_meta($intake_id, '_kd_ff_entry_id',   (int)$entry_id);
+    update_post_meta($intake_id, '_kd_intake_payload', $payload);
+    update_post_meta($intake_id, '_kd_order_id',      (int)$order_id);
+
+    if (!empty($payload['email'])) update_post_meta($intake_id, '_kd_contact_email', sanitize_email($payload['email']));
+    if ($name)                     update_post_meta($intake_id, '_kd_contact_name',  sanitize_text_field($name));
+
+    $order->update_meta_data('_kd_intake_id', (int)$intake_id);
+    $order->save_meta_data();
+
+    return (int)$intake_id;
+}
+
+/** Create/ensure Intake when payment is complete (or instantly set to processing). */
+function kdcl_on_payment_create_intake($order_id) {
+    kdcl_ensure_intake_for_order($order_id);
+}
+add_action('woocommerce_payment_complete',        'kdcl_on_payment_create_intake', 15);
+add_action('woocommerce_order_status_processing', 'kdcl_on_payment_create_intake', 15);

@@ -1,58 +1,67 @@
 <?php
-// kd-clinic/includes/admin-menu.php
 if (!defined('ABSPATH')) exit;
 
 /**
- * Create one top-level: "Diet Clinic"
+ * Top-level "Diet Clinic" menu (right under Dashboard) + submenus.
+ * Position: 3 (Dashboard ~2), so it stays at the top.
  */
 add_action('admin_menu', function () {
     add_menu_page(
         __('Diet Clinic', 'kd-clinic'),
         __('Diet Clinic', 'kd-clinic'),
-        'read',
-        'kdc-diet-clinic',
-        function () {
-            // landing: Intakes list
-            wp_safe_redirect(admin_url('edit.php?post_type=kh_intake'));
-            exit;
-        },
+        'edit_posts',
+        'edit.php?post_type=kh_intake',
+        '',
         'dashicons-heart',
-        26
+        3
     );
-}, 20);
 
-/**
- * Move CPT menus under "Diet Clinic" to avoid duplicates.
- * This assumes your CPTs are already registered by this point.
- */
-add_action('admin_init', function () {
-    // Only adjust if the CPTs exist
-    $pto_i = get_post_type_object('kh_intake');
-    $pto_p = get_post_type_object('kh_plan');
+    // Pre-Consultation (kh_intake) — read-only list
+    add_submenu_page(
+        'edit.php?post_type=kh_intake',
+        __('Pre-Consultation', 'kd-clinic'),
+        __('Pre-Consultation', 'kd-clinic'),
+        'edit_posts',
+        'edit.php?post_type=kh_intake'
+    );
 
-    // If they exist, set show_in_menu to our top-level slug.
-    if ($pto_i) {
-        add_filter('register_post_type_args', function ($args, $post_type) {
-            if ($post_type === 'kh_intake') {
-                $args['show_in_menu']     = 'kdc-diet-clinic';
-                $args['show_in_admin_bar']= false;
-            }
-            return $args;
-        }, 10, 2);
+    // Consultations (kh_consult)
+    if (post_type_exists('kh_consult')) {
+        add_submenu_page(
+            'edit.php?post_type=kh_intake',
+            __('Consultations', 'kd-clinic'),
+            __('Consultations', 'kd-clinic'),
+            'edit_posts',
+            'edit.php?post_type=kh_consult'
+        );
     }
 
-    if ($pto_p) {
-        add_filter('register_post_type_args', function ($args, $post_type) {
-            if ($post_type === 'kh_plan') {
-                $args['show_in_menu']     = 'kdc-diet-clinic';
-                $args['show_in_admin_bar']= false;
-            }
-            return $args;
-        }, 10, 2);
+    // Diet Plans (kh_plan) — we’ll rewire later
+    if (post_type_exists('kh_plan')) {
+        add_submenu_page(
+            'edit.php?post_type=kh_intake',
+            __('Diet Plans', 'kd-clinic'),
+            __('Diet Plans', 'kd-clinic'),
+            'edit_posts',
+            'edit.php?post_type=kh_plan'
+        );
     }
-}, 20);
+}, 9);
 
 /**
- * After args filters, re-register CPT menus by doing a late hook to flush menu.
- * (WP builds menu on admin_menu, so our admin_init filters apply before that.)
+ * Make kh_intake read-only (remove edit/delete/publish caps).
  */
+add_filter('user_has_cap', function ($allcaps, $caps, $args) {
+    if (!empty($args[0]) && in_array($args[0], ['edit_post','delete_post','publish_post'], true)) {
+        $post_id = isset($args[2]) ? (int)$args[2] : 0;
+        if ($post_id) {
+            $post = get_post($post_id);
+            if ($post && $post->post_type === 'kh_intake') {
+                $allcaps['edit_post']    = false;
+                $allcaps['delete_post']  = false;
+                $allcaps['publish_post'] = false;
+            }
+        }
+    }
+    return $allcaps;
+}, 10, 3);

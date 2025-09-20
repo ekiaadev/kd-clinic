@@ -1,186 +1,198 @@
 <?php
-/**
- * Community & Lose-A-Dress flows
- * - FluentForms submit → add correct item to cart → redirect to Checkout
- * - Honors HMO (free order) via session flags set from the form
- * - Supports variable product (plan attribute) OR optional plan→product mapping
- */
 if (!defined('ABSPATH')) exit;
 
-/** Lightweight logger (writes only if WP_DEBUG & WP_DEBUG_LOG are true) */
-if (!function_exists('kdc_log')) {
-    function kdc_log($msg){
-        if (defined('WP_DEBUG') && WP_DEBUG && defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
-            error_log('[KDC] '.$msg);
+/**
+ * Community + Nutrition Care flows
+ * - Community (FF ID 10): add *specific* variation based on plan_dropdown → redirect to Checkout (AJAX-safe)
+ * - Nutrition Care (FF ID 5): redirect to booking page; booking product then applies coupon automatically
+ *
+ * Variation resolution here is EXACT to your data:
+ * plan_dropdown values: 1m | 3m | 6m | 12m
+ * Woo attribute "Plan" values (slugs): 1-month | 3-months | 6-months | 12-months
+ */
+
+function kdcl_normalize_client_type($raw) {
+    $v = is_string($raw) ? strtolower(trim($raw)) : '';
+    $map = [
+        'direct'        => 'direct',
+        'hmo'           => 'hmo',
+        'bank_union'    => 'bank_union',
+        'union bank'    => 'bank_union',
+        'bank_providus' => 'bank_providus',
+        'providus bank' => 'bank_providus',
+    ];
+    return $map[$v] ?? $v;
+}
+
+/** Get a field from Fluent Forms payload (and $_POST fallback). */
+function kdcl_ffv($formData, $key) {
+    if (isset($formData[$key])) return $formData[$key];
+    if (isset($formData['fields'][$key])) return $formData['fields'][$key];
+    if (isset($_POST[$key])) return wp_unslash($_POST[$key]);
+    return '';
+}
+
+/** Map FF plan code → Woo variation slug + nice label */
+function kdcl_map_plan_code($code) {
+    $code = strtolower(trim((string)$code));
+    $map = [
+        '1m'  => ['slug' => '1-month',  'label' => '1 Month'],
+        '3m'  => ['slug' => '3-months', 'label' => '3 Months'],
+        '6m'  => ['slug' => '6-months', 'label' => '6 Months'],
+        '12m' => ['slug' => '12-months','label' => '12 Months'],
+    ];
+    return $map[$code] ?? ['slug' => '', 'label' => ''];
+}
+
+/**
+ * Find variation for the given plan slug.
+ * Checks both global attr (pa_plan) and custom attr (plan).
+ *
+ * @return array [variation_id, variation_attributes]
+ */
+function kdcl_find_variation_by_plan_slug($product, $plan_slug) {
+    if (!$product || !$product->is_type('variable')) return [0, []];
+    $plan_slug = sanitize_title($plan_slug);
+    if (!$plan_slug) return [0, []];
+
+    $variations = $product->get_available_variations();
+    if (empty($variations)) return [0, []];
+
+    foreach ($variations as $var) {
+        $attrs = $var['attributes'] ?? [];
+        // Attribute keys come like attribute_pa_plan or attribute_plan
+        $val = '';
+        if (isset($attrs['attribute_pa_plan'])) {
+            $val = $attrs['attribute_pa_plan'];
+        } elseif (isset($attrs['attribute_plan'])) {
+            $val = $attrs['attribute_plan'];
+        }
+        if ($val && sanitize_title($val) === $plan_slug) {
+            return [$var['variation_id'], $attrs];
         }
     }
+
+    // No exact match found
+    return [0, []];
 }
 
-/* ---------- Helpers ---------- */
-if (!function_exists('kd_norm')) {
-    function kd_norm($s){ $s = strtolower(trim(wp_strip_all_tags((string)$s))); return preg_replace('/[^a-z0-9]+/','',$s); }
-}
+/**
+ * After FF saves entry, set session client_type and perform per-form action.
+ * No server redirects here—AJAX response handles redirection.
+ */
+add_action('fluentform/submission_inserted', function ($entryId, $formData, $form) {
+    // Resolve form id
+    $form_id = 0;
+    if (is_object($form) && isset($form->id)) $form_id = (int)$form->id;
+    if (!$form_id && isset($formData['_form_id'])) $form_id = (int)$formData['_form_id'];
+    if (!$form_id) return;
 
-if (!function_exists('kd_map_plan_value_to_label')) {
-    // Map common short values to human labels that exist on your variations
-    function kd_map_plan_value_to_label($form_val){
-        $v = strtolower(trim($form_val));
-        $map = [
-            '1m'  => '1 Month',
-            '3m'  => '3 Months',
-            '6m'  => '6 Months',
-            '12m' => '12 Months',
-            '1'   => '1 Month',
-            '3'   => '3 Months',
-            '6'   => '6 Months',
-            '12'  => '12 Months'
-        ];
-        return $map[$v] ?? $form_val; // if form already returns labels, pass-through
+    // Store client_type in session (used by coupons)
+    $client_type = kdcl_normalize_client_type(kdcl_ffv($formData, 'client_type'));
+    if (function_exists('WC') && WC()->session) {
+        WC()->session->set('kd_client_type', $client_type ?: 'direct');
     }
-}
 
-if (!function_exists('kd_find_variation_by_plan')) {
-    /**
-     * Find a variation ID on a variable product by matching the "plan" attribute against a human label
-     * Accepts labels like "1 Month", "3 Months", etc.
-     * Will try global attr 'pa_plan', custom 'plan', and raw variation attributes (attribute_pa_plan).
-     */
-    function kd_find_variation_by_plan($product_id, $target_label){
-        if (!$product_id || !$target_label) return 0;
+    // COMMUNITY → clear cart → add the exact variation chosen via plan_dropdown
+    if ($form_id === (int) (defined('KD_FFID_COMMUNITY') ? KD_FFID_COMMUNITY : 0)) {
+        if (!function_exists('WC')) return;
+        if (!WC()->cart) wc_load_cart();
+
+        // Silent hard clear before adding the service
+        WC()->cart->empty_cart(true);
+
+        $product_id = (int) (defined('KD_COMM_PRODUCT_ID') ? KD_COMM_PRODUCT_ID : 0);
+        if ($product_id <= 0) return;
 
         $product = wc_get_product($product_id);
-        if (!$product) { kdc_log('Product not found: '.$product_id); return 0; }
-        if (!$product->is_type('variable')) { kdc_log('Product is not variable: '.$product_id); return 0; }
+        if (!$product) return;
 
-        $target = kd_norm($target_label); // e.g. "1month"
-        foreach ($product->get_children() as $vid) {
-            $v = wc_get_product($vid);
-            if (!$v || !$v->exists()) continue;
+        // Exact mapping from FF "plan_dropdown" → variation slug
+        $code = kdcl_ffv($formData, 'plan_dropdown');
+        $map  = kdcl_map_plan_code($code);
 
-            // attempt label lookups
-            foreach (['pa_plan', 'plan'] as $key) {
-                $val = $v->get_attribute($key); // returns term/label
-                if ($val && kd_norm($val) === $target) {
-                    return (int)$vid;
-                }
+        $variation_id = 0; $variation_attrs = [];
+        if ($product->is_type('variable')) {
+            if (!empty($map['slug'])) {
+                list($variation_id, $variation_attrs) = kdcl_find_variation_by_plan_slug($product, $map['slug']);
             }
-            // fallback to raw variation attributes (usually slugs)
-            $attrs = $v->get_variation_attributes(); // e.g. [ 'attribute_pa_plan' => '1-month' ]
-            foreach ($attrs as $k => $val) {
-                if (kd_norm(str_replace('-', ' ', $val)) === $target) {
-                    return (int)$vid;
+            // If still not found, fall back to product default variation (to avoid empty cart)
+            if (!$variation_id) {
+                $variations = $product->get_available_variations();
+                $defaults   = $product->get_default_attributes();
+                if (!empty($defaults)) {
+                    foreach ($variations as $var) {
+                        $attrs = $var['attributes'] ?? [];
+                        $ok = true;
+                        foreach ($defaults as $k => $v) {
+                            $key = 'attribute_' . $k;
+                            if (!isset($attrs[$key]) || sanitize_title($attrs[$key]) !== sanitize_title($v)) { $ok = false; break; }
+                        }
+                        if ($ok) { $variation_id = $var['variation_id']; $variation_attrs = $attrs; break; }
+                    }
+                }
+                // Final fallback: first available
+                if (!$variation_id && !empty($variations[0]['variation_id'])) {
+                    $variation_id   = $variations[0]['variation_id'];
+                    $variation_attrs= ($variations[0]['attributes'] ?? []);
                 }
             }
         }
-        kdc_log('No variation matched label "'.$target_label.'" on product '.$product_id);
-        return 0;
+
+        $added_key = WC()->cart->add_to_cart(
+            $product_id,
+            1,
+            $variation_id,
+            $variation_attrs,
+            ['kd_client_type' => $client_type ?: 'direct']
+        );
+
+        if ($added_key && WC()->session) {
+            WC()->session->set('kd_ff_last_form', 'community');
+        }
     }
-}
 
-/* ---------- Core: add-to-cart from FluentForms (Community / Lose) ---------- */
-add_action('fluentform_submission_inserted', function($entryId, $formData, $form) {
-    try {
-        $fid = (int)($form->id ?? 0);
-
-        // Only handle our two forms
-        $is_comm = (defined('KD_FFID_COMMUNITY') && $fid === (int)KD_FFID_COMMUNITY);
-        $is_lose = (defined('KD_FFID_LOSE')      && $fid === (int)KD_FFID_LOSE);
-        if (!$is_comm && !$is_lose) return;
-
-        if (!function_exists('WC') || !WC()->session) { kdc_log('WC session unavailable on FF submit'); return; }
-
-        // Extract fields (FF sends either ['fields'=>...] or flat array)
-        $fields = is_array($formData) ? ($formData['fields'] ?? $formData) : [];
-
-        // HMO flags from form (client_type: 'hmo' or 'private')
-        $ct = strtolower(trim($fields['client_type'] ?? 'private'));
-        WC()->session->set('kd_client_type', in_array($ct, ['hmo','private'], true) ? $ct : 'private');
-        if (!empty($fields['hmo_provider']))  WC()->session->set('kd_hmo_provider',  sanitize_text_field($fields['hmo_provider']));
-        if (!empty($fields['hmo_member_id'])) WC()->session->set('kd_hmo_member_id', sanitize_text_field($fields['hmo_member_id']));
-
-        if (!WC()->cart) { kdc_log('WC cart unavailable on FF submit'); return; }
-
-        // Enforce single-service start: clear cart if configured
-        if (defined('KD_CLEAR_CART_ON_FORM') && KD_CLEAR_CART_ON_FORM && WC()->cart->get_cart_contents_count() > 0) {
-            WC()->cart->empty_cart();
-            kdc_log('Cart emptied at form submit (single-service start)');
-        }
-
-        /* ====== COMMUNITY ====== */
-        if ($is_comm) {
-            if (!defined('KD_COMM_PRODUCT_ID') || !KD_COMM_PRODUCT_ID) { kdc_log('KD_COMM_PRODUCT_ID undefined'); return; }
-
-            // Accept multiple possible field keys (yours is 'plan_dropdown')
-            $plan_raw = '';
-            foreach (['plan_dropdown','plan','plan_select','plan_choice'] as $key) {
-                if (isset($fields[$key]) && $fields[$key] !== '') { $plan_raw = $fields[$key]; break; }
-            }
-            if ($plan_raw === '') {
-                if (function_exists('wc_add_notice')) wc_add_notice(__('Please choose a plan.', 'kd'), 'error');
-                kdc_log('Community submit missing plan field');
-                return;
-            }
-
-            $plan_label = kd_map_plan_value_to_label($plan_raw); // maps 1m→1 Month, etc.
-
-            // OPTIONAL: plan→product mapping (skip variations entirely)
-            $map = apply_filters('kdc_comm_plan_product_map', []);
-            if (!empty($map)) {
-                $key1 = strtolower(trim($plan_raw));
-                $key2 = strtolower(trim($plan_label));
-                $pid  = isset($map[$key1]) ? (int)$map[$key1] : (isset($map[$key2]) ? (int)$map[$key2] : 0);
-                if ($pid > 0) {
-                    WC()->cart->add_to_cart($pid, 1);
-                    kdc_log('Community plan mapped to simple product ID '.$pid.' via kdc_comm_plan_product_map');
-                    return; // done
-                }
-            }
-
-            // Default path: variable product with plan attribute
-            $vid = kd_find_variation_by_plan((int)KD_COMM_PRODUCT_ID, $plan_label);
-            if (!$vid) {
-                if (function_exists('wc_add_notice')) {
-                    wc_add_notice(__('We couldn’t match your selected plan. Please refresh and try again.', 'kd'), 'error');
-                }
-                kdc_log('Community: no variation matched for plan "'.$plan_label.'" on product '.KD_COMM_PRODUCT_ID);
-                return;
-            }
-
-            $vprod = wc_get_product($vid);
-            $attrs = $vprod ? $vprod->get_variation_attributes() : [];
-            WC()->cart->add_to_cart((int)KD_COMM_PRODUCT_ID, 1, (int)$vid, $attrs);
-            kdc_log('Community added: parent='.KD_COMM_PRODUCT_ID.' variation='.$vid.' plan="'.$plan_label.'"');
-        }
-
-        /* ====== LOSE A DRESS ====== */
-        if ($is_lose) {
-            if (!defined('KD_LOSE_PRODUCT_ID') || !KD_LOSE_PRODUCT_ID) { kdc_log('KD_LOSE_PRODUCT_ID undefined'); return; }
-            WC()->cart->add_to_cart((int)KD_LOSE_PRODUCT_ID, 1);
-            kdc_log('Lose A Dress added: '.KD_LOSE_PRODUCT_ID);
-        }
-
-    } catch (\Throwable $e) {
-        kdc_log('FF submit error: '.$e->getMessage().' @'.$e->getFile().':'.$e->getLine());
-        // Soft-fail: do not throw; FF will show default confirmation if any
-        return;
+    // NUTRITION CARE → mark for redirect to booking page
+    if ($form_id === (int) (defined('KD_FFID_INTAKE') ? KD_FFID_INTAKE : 0) && function_exists('WC') && WC()->session) {
+        WC()->session->set('kd_ff_last_form', 'nutrition');
     }
 }, 10, 3);
 
-/* ---------- Redirect these two forms to Checkout (FF version-agnostic) ---------- */
-add_filter('fluentform/submission_confirmation', function($return, $form = null, $confirmation = null, $entryId = null, $formData = null){
-    // Determine form ID safely (object or array)
-    $fid = 0;
-    if (is_object($form) && isset($form->id))      $fid = (int)$form->id;
-    elseif (is_array($form) && isset($form['id'])) $fid = (int)$form['id'];
+/**
+ * AJAX response redirect:
+ *  - Community  → Checkout
+ *  - Nutrition  → Nutrition booking URL
+ */
+add_filter('fluentform_submission_response', function ($response, $formData, $form) {
+    $form_id = 0;
+    if (is_object($form) && isset($form->id)) $form_id = (int)$form->id;
+    if (!$form_id && isset($formData['_form_id'])) $form_id = (int)$formData['_form_id'];
+    if (!$form_id || !function_exists('WC') || !WC()->session) return $response;
 
-    $is_comm = (defined('KD_FFID_COMMUNITY') && $fid === (int)KD_FFID_COMMUNITY);
-    $is_lose = (defined('KD_FFID_LOSE')      && $fid === (int)KD_FFID_LOSE);
-    if (!$is_comm && !$is_lose) return $return;
+    $flag = WC()->session->get('kd_ff_last_form');
+    if (!$flag) return $response;
 
-    if (!function_exists('wc_get_checkout_url')) return $return;
+    if ($flag === 'community' && $form_id === (int) (defined('KD_FFID_COMMUNITY') ? KD_FFID_COMMUNITY : 0)) {
+        $target = wc_get_checkout_url();
+    } elseif ($flag === 'nutrition' && $form_id === (int) (defined('KD_FFID_INTAKE') ? KD_FFID_INTAKE : 0)) {
+        $target = home_url(defined('KD_NUTRI_BOOKING_URL') ? KD_NUTRI_BOOKING_URL : '/');
+    } else {
+        return $response;
+    }
 
-    $return['type']       = 'redirect';
-    $return['redirectTo'] = wc_get_checkout_url();
-    $return['message']    = '';
-    return $return;
-}, 20, 5);
+    WC()->session->__unset('kd_ff_last_form');
+
+    $response['result']     = 'success';
+    $response['message']    = isset($response['message']) ? $response['message'] : __('Redirecting…', 'kd-clinic');
+    $response['redirectTo'] = esc_url_raw($target);
+    return $response;
+}, 10, 3);
+
+/** Stamp client_type onto cart items for safety (coupons read this if session is lost) */
+add_filter('woocommerce_add_cart_item_data', function ($cart_item_data, $product_id, $variation_id) {
+    if (function_exists('WC') && WC()->session) {
+        $t = WC()->session->get('kd_client_type');
+        if ($t) $cart_item_data['kd_client_type'] = $t;
+    }
+    return $cart_item_data;
+}, 10, 3);
