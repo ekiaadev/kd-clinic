@@ -5,7 +5,7 @@
  * Plugin URI: https://www.bixrx.ng
  * Author: BizRx Digital Klinik
  * Author URI: https://www.instagram.com/bizrxng
- * Version: 7.6
+ * Version: 8.6
  */
 
 if (!defined('ABSPATH')) exit;

@@ -81,16 +81,16 @@ function kdcl_find_variation_by_plan_slug($product, $plan_slug) {
  * No server redirects here—AJAX response handles redirection.
  */
 add_action('fluentform/submission_inserted', function ($entryId, $formData, $form) {
-    // Resolve form id
     $form_id = 0;
     if (is_object($form) && isset($form->id)) $form_id = (int)$form->id;
     if (!$form_id && isset($formData['_form_id'])) $form_id = (int)$formData['_form_id'];
     if (!$form_id) return;
 
-    // Store client_type in session (used by coupons)
     $client_type = kdcl_normalize_client_type(kdcl_ffv($formData, 'client_type'));
+
     if (function_exists('WC') && WC()->session) {
         WC()->session->set('kd_client_type', $client_type ?: 'direct');
+        WC()->session->set('kd_ff_entry_id', (int)$entryId); // NEW: store entry id
     }
 
     // COMMUNITY → clear cart → add the exact variation chosen via plan_dropdown

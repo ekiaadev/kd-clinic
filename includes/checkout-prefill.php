@@ -1,44 +1,39 @@
-<?php if (!defined('ABSPATH')) exit;
+<?php
+if (!defined('ABSPATH')) exit;
 
-add_action('template_redirect', function () {
-    if (!function_exists('is_checkout') || !is_checkout()) return;
-    if (!function_exists('WC') || !WC()->session) return;
-
-    $u = wp_get_current_user();
-    $first = $u->first_name ?: ''; $last = $u->last_name ?: '';
-    if (!$first && !$last) list($first,$last) = kd_split_name($u->display_name);
-
-    $customer = WC()->customer;
-    if ($first) $customer->set_billing_first_name($first);
-    if ($last)  $customer->set_billing_last_name($last);
-    if ($u->user_email) $customer->set_billing_email($u->user_email);
-    $customer->save();
-
-    WC()->session->set('kd_contact_first', $first);
-    WC()->session->set('kd_contact_last',  $last);
-    WC()->session->set('kd_contact_email', $u->user_email ?: '');
-}, 1);
+function kdcl_split_name_local($name){
+    $name=trim((string)$name); if($name==='') return ['first'=>'','last'=>''];
+    $p=preg_split('/\s+/', $name); $first=array_shift($p); $last=implode(' ',$p);
+    return ['first'=>$first,'last'=>$last];
+}
 
 add_filter('woocommerce_checkout_fields', function($fields){
-    if (!function_exists('WC') || !WC()->session) return $fields;
-    $s = WC()->session;
-    foreach ([
-        'billing_first_name' => $s->get('kd_contact_first'),
-        'billing_last_name'  => $s->get('kd_contact_last'),
-        'billing_email'      => $s->get('kd_contact_email'),
-    ] as $key => $val) {
-        if (!empty($val) && isset($fields['billing'][$key])) {
-            $fields['billing'][$key]['default'] = $val;
-        }
-    }
+    if(!function_exists('WC') || !WC()->session) return $fields;
+    $nm=(string)WC()->session->get('kd_contact_name');
+    $em=(string)WC()->session->get('kd_contact_email');
+    $ph=(string)WC()->session->get('kd_contact_phone');
+    $sp=kdcl_split_name_local($nm);
+    $fields['billing']['billing_first_name']['default']= $sp['first'] ?: ($fields['billing']['billing_first_name']['default'] ?? '');
+    $fields['billing']['billing_last_name']['default'] = $sp['last']  ?: ($fields['billing']['billing_last_name']['default']  ?? '');
+    $fields['billing']['billing_email']['default']     = $em ?: ($fields['billing']['billing_email']['default'] ?? '');
+    $fields['billing']['billing_phone']['default']     = $ph ?: ($fields['billing']['billing_phone']['default'] ?? '');
     return $fields;
-}, 10, 1);
+}, 9);
 
-add_filter('woocommerce_checkout_get_value', function($value, $input){
-    if (!function_exists('WC') || !WC()->session) return $value;
-    $s = WC()->session;
-    if ($input === 'billing_first_name' && $s->get('kd_contact_first')) return $s->get('kd_contact_first');
-    if ($input === 'billing_last_name'  && $s->get('kd_contact_last'))  return $s->get('kd_contact_last');
-    if ($input === 'billing_email'      && $s->get('kd_contact_email')) return $s->get('kd_contact_email');
-    return $value;
-}, 10, 2);
+add_filter('woocommerce_checkout_get_value', function($value,$input){
+    if(!function_exists('WC') || !WC()->session) return $value;
+    $nm=(string)WC()->session->get('kd_contact_name');
+    $em=(string)WC()->session->get('kd_contact_email');
+    $ph=(string)WC()->session->get('kd_contact_phone');
+    $sp=kdcl_split_name_local($nm);
+    switch($input){
+        case 'billing_first_name':
+        case 'account_first_name': return $sp['first'] ?: $value;
+        case 'billing_last_name':
+        case 'account_last_name':  return $sp['last']  ?: $value;
+        case 'billing_email':
+        case 'account_email':      return $em ?: $value;
+        case 'billing_phone':      return $ph ?: $value;
+        default: return $value;
+    }
+}, 9, 2);

@@ -2,140 +2,189 @@
 if (!defined('ABSPATH')) exit;
 
 /**
- * Service form IDs helper (only those that are defined).
- * Currently: Community (KD_FFID_COMMUNITY), Nutrition Care (KD_FFID_INTAKE)
+ * Defer/Intake glue with LOCAL helper names only (no collisions).
+ * - Creates/updates Intake immediately on FF submit
+ * - Stores name/email/phone + client_type in WC session (prefill & coupons)
+ * - Links Intake/FF to order; marks Intake paid on payment
+ *
+ * All helpers here use kdcl__* (double underscore) and will not clash
+ * with helpers defined in other files (e.g., admin-intakes.php).
  */
-function kdcl_service_form_ids() {
-    $ids = [];
-    if (defined('KD_FFID_COMMUNITY')) $ids[] = (int) KD_FFID_COMMUNITY;
-    if (defined('KD_FFID_INTAKE'))    $ids[] = (int) KD_FFID_INTAKE;
-    return $ids;
-}
 
-/** True if a form id is one of our service forms */
-function kdcl_is_service_form_id($form_id) {
-    return in_array((int)$form_id, kdcl_service_form_ids(), true);
-}
+/* ---------- LOCAL HELPERS (PRIVATE NAMES) ---------- */
 
-/**
- * After FF saves an entry, flip to pending_payment and stash in session (service forms only)
- */
-add_action('fluentform/submission_inserted', function ($entryId, $formData, $form) {
-    // Resolve form id (works for object or array shapes)
-    $fid = 0;
-    if (is_object($form) && isset($form->id)) $fid = (int) $form->id;
-    if (!$fid && isset($formData['_form_id'])) $fid = (int) $formData['_form_id'];
-
-    // If not a service form, do nothing
-    if (!$fid || !kdcl_is_service_form_id($fid)) return;
-
+function kdcl__ff_details_payload($entry_id){
     global $wpdb;
-    $table = $wpdb->prefix . 'fluentform_submissions';
-
-    // Set status to pending_payment (keeps FF clean until payment)
-    $wpdb->update($table, ['status' => 'pending_payment'], ['id' => (int)$entryId], ['%s'], ['%d']);
-
-    // Remember entry for the next order to link
-    if (function_exists('WC') && WC()->session) {
-        WC()->session->set('kd_pending_entry_id', (int)$entryId);
+    $rows = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT field_name, field_value FROM {$wpdb->prefix}fluentform_entry_details WHERE submission_id = %d",
+            (int)$entry_id
+        ),
+        ARRAY_A
+    );
+    $out = [];
+    foreach ((array)$rows as $r) {
+        $k = isset($r['field_name']) ? sanitize_key($r['field_name']) : '';
+        if ($k === '') continue;
+        $out[$k] = isset($r['field_value']) ? maybe_unserialize($r['field_value']) : '';
     }
+    return $out;
+}
+
+function kdcl__ff_raw_payload($formData){
+    $src = (isset($formData['fields']) && is_array($formData['fields'])) ? $formData['fields'] : (array)$formData;
+    $out = [];
+    foreach ($src as $k => $v) {
+        $key = sanitize_key($k); if ($key === '') continue;
+        $out[$key] = is_array($v) ? array_map('sanitize_text_field', $v) : sanitize_text_field((string)$v);
+    }
+    return $out;
+}
+
+function kdcl__best_full_name(array $p){
+    $first=''; $last=''; $single='';
+    foreach (['first_name','firstname','first','first-name','first name'] as $k) {
+        if (!empty($p[$k])) { $first = is_array($p[$k]) ? implode(' ', $p[$k]) : (string)$p[$k]; break; }
+    }
+    foreach (['last_name','lastname','last','surname','last-name','last name'] as $k) {
+        if (!empty($p[$k])) { $last  = is_array($p[$k]) ? implode(' ', $p[$k]) : (string)$p[$k]; break; }
+    }
+    foreach (['names','full_name','fullname','name'] as $k) {
+        if (!empty($p[$k])) { $single = is_array($p[$k]) ? implode(' ', $p[$k]) : (string)$p[$k]; break; }
+    }
+    $first = trim($first); $last = trim($last); $single = trim($single);
+    if ($first || $last) return trim($first.' '.$last);
+    return $single ?: '';
+}
+
+function kdcl__set_cookie($name,$value,$ttl=3600){
+    if (headers_sent()) return;
+    setcookie($name,(string)$value,time()+(int)$ttl, COOKIEPATH?:'/', COOKIE_DOMAIN, is_ssl(), true);
+}
+
+/* ---------- INTAKE CREATION (IDEMPOTENT) ---------- */
+
+function kdcl__create_or_update_intake($entry_id,$formData=[]){
+    $existing = get_posts([
+        'post_type'      => 'kh_intake',
+        'post_status'    => ['private','publish','draft'],
+        'meta_key'       => '_kd_ff_entry_id',
+        'meta_value'     => (int)$entry_id,
+        'fields'         => 'ids',
+        'posts_per_page' => 1,
+        'no_found_rows'  => true,
+    ]);
+    $intake_id = !empty($existing[0]) ? (int)$existing[0] : 0;
+
+    $payload = kdcl__ff_details_payload($entry_id);
+    if (empty($payload) && !empty($formData)) $payload = kdcl__ff_raw_payload($formData);
+
+    $name = kdcl__best_full_name($payload);
+    if ($name === '') $name = 'Unknown';
+    $title = sprintf('%s (Intake – %d)', wp_strip_all_tags($name), (int)$entry_id);
+
+    if ($intake_id) {
+        update_post_meta($intake_id, '_kd_intake_payload', $payload);
+        update_post_meta($intake_id, '_kd_contact_name',   $name);
+        if (!empty($payload['email'])) update_post_meta($intake_id, '_kd_contact_email', sanitize_email($payload['email']));
+        if (!get_post_meta($intake_id, '_kd_payment_status', true)) update_post_meta($intake_id, '_kd_payment_status', 'awaiting');
+        return (int)$intake_id;
+    }
+
+    $intake_id = wp_insert_post([
+        'post_title'  => $title,
+        'post_type'   => 'kh_intake',
+        'post_status' => 'private',
+        'post_author' => get_current_user_id(),
+    ], true);
+    if (is_wp_error($intake_id) || !$intake_id) return 0;
+
+    update_post_meta($intake_id, '_kd_ff_entry_id',    (int)$entry_id);
+    update_post_meta($intake_id, '_kd_intake_payload', $payload);
+    update_post_meta($intake_id, '_kd_contact_name',   $name);
+    if (!empty($payload['email'])) update_post_meta($intake_id, '_kd_contact_email', sanitize_email($payload['email']));
+    update_post_meta($intake_id, '_kd_payment_status', 'awaiting');
+
+    return (int)$intake_id;
+}
+
+/* ---------- FF SUBMIT: CREATE INTAKE + STASH SESSION ---------- */
+add_action('fluentform/submission_inserted', function($entryId,$formData,$form){
+    // We purposely do not depend on a specific form ID here.
+    $intake_id = kdcl__create_or_update_intake((int)$entryId, $formData);
+
+    // Capture contact + client type for prefill & coupons
+    $raw   = kdcl__ff_raw_payload($formData);
+    $name  = kdcl__best_full_name($raw);
+    $email = isset($raw['email']) ? (string)$raw['email'] : '';
+    $phone = isset($raw['phone']) ? (string)$raw['phone'] : '';
+    $ctype = '';
+    foreach (['client_type','clienttype','payment_option'] as $k) {
+        if (!empty($raw[$k])) { $ctype = (string)$raw[$k]; break; }
+    }
+
+    if (function_exists('WC') && WC()->session) {
+        WC()->session->set('kd_ff_entry_id',   (int)$entryId);
+        WC()->session->set('kd_intake_id',     (int)$intake_id);
+        WC()->session->set('kd_contact_name',  $name);
+        WC()->session->set('kd_contact_email', $email);
+        WC()->session->set('kd_contact_phone', $phone);
+        if ($ctype !== '') WC()->session->set('kd_client_type', $ctype);
+        WC()->session->set('kd_service_flow',  1);
+    }
+    kdcl__set_cookie('kd_ff_entry_id', (int)$entryId, 3600);
+    kdcl__set_cookie('kd_intake_id',   (int)$intake_id, 3600);
 }, 9, 3);
 
-/**
- * When checkout creates an order, link the pending FF entry to that order (service only)
- */
+/* ---------- ORDER CREATION: LINK INTAKE / ENTRY ---------- */
 add_action('woocommerce_checkout_create_order', function ($order, $data) {
-    if (!function_exists('WC') || !WC()->session) return;
-    $entry_id = (int) WC()->session->get('kd_pending_entry_id');
-    if ($entry_id) {
-        $order->update_meta_data('_kd_pending_entry_id', $entry_id);
-    }
-}, 10, 2);
+    if (!function_exists('WC')) return;
+    $intake_id = 0; $entry_id = 0;
 
-/**
- * On payment success, publish the entry and store _kd_order_id meta
- */
-function kdcl_publish_pending_entry($order_id) {
+    if (WC()->session) {
+        $intake_id = (int) WC()->session->get('kd_intake_id');
+        $entry_id  = (int) WC()->session->get('kd_ff_entry_id');
+    }
+    if (!$intake_id && isset($_COOKIE['kd_intake_id']))  $intake_id = (int) $_COOKIE['kd_intake_id'];
+    if (!$entry_id  && isset($_COOKIE['kd_ff_entry_id'])) $entry_id  = (int) $_COOKIE['kd_ff_entry_id'];
+
+    if ($intake_id > 0) $order->update_meta_data('_kd_intake_id', (int)$intake_id);
+    if ($entry_id  > 0) $order->update_meta_data('_kd_pending_entry_id', (int)$entry_id);
+}, 20, 2);
+
+/* ---------- PAYMENT: MARK INTAKE PAID + PUBLISH FF ENTRY ---------- */
+function kdcl__on_payment_mark_paid($order_id){
     $order = wc_get_order($order_id);
     if (!$order) return;
 
-    $entry_id = (int) $order->get_meta('_kd_pending_entry_id');
-    if (!$entry_id) return;
+    $intake_id = (int) $order->get_meta('_kd_intake_id');
+    $entry_id  = (int) $order->get_meta('_kd_pending_entry_id');
 
-    global $wpdb;
-    $subs_table  = $wpdb->prefix . 'fluentform_submissions';
-    $meta_table  = $wpdb->prefix . 'fluentform_submission_meta';
+    if ($intake_id > 0) {
+        update_post_meta($intake_id, '_kd_order_id', (int)$order_id);
+        update_post_meta($intake_id, '_kd_payment_status', 'paid');
+    }
 
-    // Only promote if still pending_payment
-    $status = $wpdb->get_var($wpdb->prepare("SELECT status FROM {$subs_table} WHERE id = %d", $entry_id));
-    if ($status !== 'pending_payment') return;
+    if ($entry_id > 0) {
+        global $wpdb;
+        $subs = $wpdb->prefix.'fluentform_submissions';
+        $status = $wpdb->get_var($wpdb->prepare("SELECT status FROM {$subs} WHERE id = %d", (int)$entry_id));
+        if ($status && $status !== 'published') {
+            $wpdb->update($subs, ['status' => 'published'], ['id' => (int)$entry_id], ['%s'], ['%d']);
+        }
+        $meta = $wpdb->prefix.'fluentform_submission_meta';
+        $wpdb->insert($meta, [
+            'submission_id' => (int)$entry_id,
+            'meta_key'      => '_kd_order_id',
+            'meta_value'    => (string)$order_id
+        ], ['%d','%s','%s']);
+    }
 
-    // Publish entry
-    $wpdb->update($subs_table, ['status' => 'published'], ['id' => $entry_id], ['%s'], ['%d']);
-
-    // Link order id in FF meta
-    $wpdb->insert($meta_table, [
-        'submission_id' => $entry_id,
-        'meta_key'      => '_kd_order_id',
-        'meta_value'    => (string) $order_id
-    ], ['%d','%s','%s']);
-
-    // Clear session pointer
     if (function_exists('WC') && WC()->session) {
-        WC()->session->__unset('kd_pending_entry_id');
+        WC()->session->__unset('kd_intake_id');
+        WC()->session->__unset('kd_ff_entry_id');
+        WC()->session->__unset('kd_service_flow');
     }
 }
-add_action('woocommerce_payment_complete',         'kdcl_publish_pending_entry', 10);
-add_action('woocommerce_order_status_processing',  'kdcl_publish_pending_entry', 10); // sync payments safety
-
-/**
- * On failed/cancelled/refunded orders, delete the pending entry to avoid clutter
- */
-function kdcl_delete_pending_entry($order_id) {
-    $order = wc_get_order($order_id);
-    if (!$order) return;
-
-    $entry_id = (int) $order->get_meta('_kd_pending_entry_id');
-    if (!$entry_id) return;
-
-    global $wpdb;
-    $subs   = $wpdb->prefix . 'fluentform_submissions';
-    $det    = $wpdb->prefix . 'fluentform_entry_details';
-    $meta   = $wpdb->prefix . 'fluentform_submission_meta';
-
-    // Only delete if still pending_payment (never delete real/published entries)
-    $status = $wpdb->get_var($wpdb->prepare("SELECT status FROM {$subs} WHERE id = %d", $entry_id));
-    if ($status !== 'pending_payment') return;
-
-    $wpdb->delete($meta, ['submission_id' => $entry_id], ['%d']);
-    $wpdb->delete($det,  ['submission_id' => $entry_id], ['%d']);
-    $wpdb->delete($subs, ['id' => $entry_id],            ['%d']);
-}
-add_action('woocommerce_order_status_failed',    'kdcl_delete_pending_entry', 10);
-add_action('woocommerce_order_status_cancelled', 'kdcl_delete_pending_entry', 10);
-add_action('woocommerce_order_status_refunded',  'kdcl_delete_pending_entry', 10);
-
-/**
- * Hourly purge: remove stale pending_payment entries older than 1 hour (no linked paid order)
- * The cron event 'kdcl_purge_stale_ff_entries' is scheduled in the main plugin on activation.
- */
-add_action('kdcl_purge_stale_ff_entries', function () {
-    global $wpdb;
-    $subs   = $wpdb->prefix . 'fluentform_submissions';
-    $det    = $wpdb->prefix . 'fluentform_entry_details';
-    $meta   = $wpdb->prefix . 'fluentform_submission_meta';
-
-    $cutoff = gmdate('Y-m-d H:i:s', time() - HOUR_IN_SECONDS);
-
-    $ids = $wpdb->get_col($wpdb->prepare(
-        "SELECT id FROM {$subs} WHERE status = %s AND created_at < %s",
-        'pending_payment', $cutoff
-    ));
-    if (empty($ids)) return;
-
-    foreach ($ids as $entry_id) {
-        $wpdb->delete($meta, ['submission_id' => (int)$entry_id], ['%d']);
-        $wpdb->delete($det,  ['submission_id' => (int)$entry_id], ['%d']);
-        $wpdb->delete($subs, ['id' => (int)$entry_id],            ['%d']);
-    }
-});
+add_action('woocommerce_payment_complete',        'kdcl__on_payment_mark_paid', 15);
+add_action('woocommerce_order_status_processing', 'kdcl__on_payment_mark_paid', 15);
